@@ -22,8 +22,8 @@ create trigger skills_touch_updated_at
   for each row execute function public.touch_updated_at();
 
 -- Skills are public instructions, so anonymous reads are allowed and writes
--- are not. The server uses the anon key; the seed script uses the service role
--- key, which bypasses these policies.
+-- are not. The server uses the publishable (anon) key; the seed script uses the
+-- secret (service role) key, which bypasses the row level policies.
 alter table public.skills enable row level security;
 
 drop policy if exists "skills are publicly readable" on public.skills;
@@ -31,3 +31,10 @@ create policy "skills are publicly readable"
   on public.skills for select
   to anon, authenticated
   using (true);
+
+-- Table privileges are separate from row level security: you need both. Newer
+-- Supabase projects do not grant these by default, so set them explicitly or
+-- every request fails with "permission denied for table skills" (42501).
+grant usage on schema public to anon, authenticated, service_role;
+grant select on public.skills to anon, authenticated;
+grant all    on public.skills to service_role;

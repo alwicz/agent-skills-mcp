@@ -28,6 +28,29 @@ function slug(text: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/**
+ * How well one skill answers a query. Higher wins; 0 means no match.
+ *
+ * Ordered so an exact name beats a phrase that contains the name, which beats
+ * word overlap, which beats a word appearing only in the description.
+ */
+function score(skill: Skill, wanted: string, wantedTokens: string[]): number {
+  const nameSlug = slug(skill.name);
+
+  if (nameSlug === wanted) return 1000;
+  if (wanted.includes(nameSlug) || nameSlug.includes(wanted)) return 500;
+
+  const nameTokens = new Set(nameSlug.split("-"));
+  const descSlug = slug(skill.description);
+
+  let total = 0;
+  for (const token of wantedTokens) {
+    if (nameTokens.has(token)) total += 10;
+    else if (descSlug.includes(token)) total += 1;
+  }
+  return total;
+}
+
 async function fetchSkills(): Promise<Skill[] | null> {
   if (!SUPABASE_URL || !SUPABASE_KEY) return null;
 
@@ -83,19 +106,28 @@ export async function getSkill(name: string): Promise<string> {
   if (skills.length === 0) return "The skill store is empty. Run `npm run seed`.";
 
   const wanted = slug(name);
+  // Agents pass anything from "video-analysis" to a whole sentence, so score
+  // candidates rather than requiring the query to be a substring of the name.
+  const wantedTokens = wanted.split("-").filter((t) => t.length > 2);
 
-  const exact = skills.find((s) => slug(s.name) === wanted);
-  if (exact) return exact.body;
+  const scored = skills
+    .map((skill) => ({ skill, score: score(skill, wanted, wantedTokens) }))
+    .filter((row) => row.score > 0)
+    .sort((a, b) => b.score - a.score);
 
-  const partial = skills.filter(
-    (s) => slug(s.name).includes(wanted) || slug(s.description).includes(wanted),
-  );
-  if (partial.length === 1) return partial[0].body;
-  if (partial.length > 1) {
-    const names = partial.map((s) => s.name).join(", ");
-    return `Several skills match "${name}": ${names}. Ask for one by name.`;
+  if (scored.length === 0) {
+    const names = skills.map((s) => s.name).join(", ");
+    return `No skill matches "${name}". Available: ${names}.`;
   }
 
-  const names = skills.map((s) => s.name).join(", ");
-  return `No skill matches "${name}". Available: ${names}.`;
+  // A clear winner wins. A tie means the request was genuinely ambiguous.
+  if (scored.length === 1 || scored[0].score > scored[1].score) {
+    return scored[0].skill.body;
+  }
+
+  const tied = scored
+    .filter((row) => row.score === scored[0].score)
+    .map((row) => row.skill.name)
+    .join(", ");
+  return `Several skills match "${name}": ${tied}. Ask for one by name.`;
 }
