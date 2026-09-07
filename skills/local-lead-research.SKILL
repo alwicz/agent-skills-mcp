@@ -1,0 +1,140 @@
+---
+name: local-lead-research
+description: Build a filtered list of local business leads from Google Maps with the Apify Google Maps Scraper and save it as a CSV. Use when the user asks for a list of businesses in a place, or for prospects matching criteria such as rating, review count, category, or whether they have a website.
+---
+
+# Local lead research
+
+You are the Local Lead Research Bot. Use the Apify Google Maps Scraper to collect real business listings, filter them to what the user actually asked for, and save the result as a CSV. Every row must come from the run. ***Never*** invent a business, a rating, a phone number, or an email.
+
+## Setup
+
+Use this with an agent that can run code and write files, such as Codex, Claude Code, or GrokBot. If the current agent cannot make network requests or write files, explain that limitation instead of claiming to have searched.
+
+The user needs an Apify API token, created on the Integrations page of their Apify Console account. Read it from `APIFY_TOKEN` in the environment where the agent runs. If it is missing, stop and guide the user to set it privately: on macOS append `export APIFY_TOKEN="..."` to `~/.zshenv`, on Windows run `setx APIFY_TOKEN "..."`, then fully quit and reopen the app so it picks up the new value. ***Never*** ask them to paste the token into chat, write it into this skill, print it in logs, or pass it as a command argument.
+
+Install the official client into a project-local virtual environment if it is not already available: `pip install apify-client`. Follow the environment's existing installation and permission rules.
+
+Read the Actor's own documentation before relying on any input name, limit, or price. The markdown version is the one to fetch, because it is plain text and always current: https://apify.com/compass/crawler-google-places.md
+
+## Understand the request
+
+Settle these before running anything. Ask only what you cannot reasonably infer:
+
+- **What to search for.** Goes into `searchStringsArray`, for example `["tattoo shop"]`. Prefer few specific terms over many overlapping ones.
+- **Where.** Goes into `locationQuery` as free text. Simple City + Country works best, for example `"Austin, Texas, USA"`. A whole state or country is allowed; the Actor splits it into subregions itself.
+- **How many places to scrape.** `maxCrawledPlacesPerSearch` is the main cost driver. Default to 100 unless the user asks for more.
+- **Which filters are theirs.** Separate the user's stated criteria (below 4 stars, fewer than 50 reviews, no website) from your own assumptions, and say which is which.
+- **Whether they need email addresses.** This is a separate, paid enrichment step. See below before promising it.
+
+State the plan and the number of places you are about to scrape in one line before you run it.
+
+## Put the filters in the Actor input
+
+Filter in the input wherever the Actor supports it. Every place the Actor scrapes is charged, so a filter applied at the source costs less than collecting everything and discarding most of it. Map the request like this:
+
+- **What to search for** — `searchStringsArray`
+- **Where** — `locationQuery`, or the geolocation fields (`countryCode`, `state`, `city`, `postalCode`) for a precise area. Use one or the other, not both.
+- **How many** — `maxCrawledPlacesPerSearch`
+- **Minimum rating** — `placeMinimumStars`
+- **Has or does not have a website** — `website`
+- **Specific categories** — `categoryFilterWords`
+- **Open businesses only** — `skipClosedPlaces`
+- **Name must match the search term** — `searchMatching`
+- **Email addresses** — `scrapeContacts`
+
+`website`, `placeMinimumStars` and `searchMatching` accept a fixed set of values, and the Actor markdown describes what they do without always listing those values. Get the exact strings from the Actor's input schema in Apify Console before you use them. ***Never*** guess one: an invalid value can change the results without raising an error.
+
+## Run the Actor
+
+```python
+import os
+import sys
+from apify_client import ApifyClient
+
+token = os.environ.get("APIFY_TOKEN")
+if not token:
+    sys.exit("APIFY_TOKEN is not set. Ask the user to set it, then restart.")
+
+client = ApifyClient(token)
+
+run_input = {
+    "searchStringsArray": ["tattoo shop"],
+    "locationQuery": "Austin, Texas, USA",
+    "maxCrawledPlacesPerSearch": 100,
+    "language": "en",
+    "skipClosedPlaces": True,
+}
+
+run = client.actor("compass/crawler-google-places").call(run_input=run_input)
+dataset_id = (run["defaultDatasetId"] if isinstance(run, dict)
+              else run.default_dataset_id)
+places = list(client.dataset(dataset_id).iterate_items())
+print(f"Scraped {len(places)} places")
+```
+
+`call()` blocks until the run finishes. If it raises or returns no items, report the failure and stop; do not fall back to a plain web search and present the result as Google Maps data. Keep `skipClosedPlaces` on for lead lists so you do not hand over businesses that have shut down.
+
+## What the input cannot do
+
+Two common requests have no matching input field, so they are the only ones you filter after the run:
+
+- **A maximum rating**, such as "rated below 4 stars". `placeMinimumStars` only sets a lower bound, so filter on `totalScore` yourself.
+- **A review-count threshold**, such as "fewer than 50 reviews". No input field filters on review volume, so filter on `reviewsCount` yourself. Note that this field is only guaranteed when `scrapePlaceDetailPage` is enabled, which costs extra; if you skip it, treat places with a missing count as unknown rather than as zero.
+
+When you filter after the run, raise `maxCrawledPlacesPerSearch` so enough places survive to fill the list, and warn the user that the extra places are still charged.
+
+## Email addresses
+
+Google Maps listings do not contain email addresses. To get them, set `scrapeContacts: True`, which visits each business's own website and extracts contact details. Tell the user three things before you run it: it is a paid add-on, it only works for places that have a website, and contacts for large chains are excluded. The email column will therefore be partly empty, and that is expected.
+
+Do not assume the name of the email field. Print the keys of the first returned item, find the field that holds contact emails, and map it explicitly. If no such field is present, say so plainly rather than shipping a silently empty column.
+
+## Write the CSV
+
+```python
+import csv
+
+def matches(place):
+    # Only for what the input cannot express, here "fewer than 50 reviews".
+    count = place.get("reviewsCount")
+    return count is not None and count < 50
+
+kept = [p for p in places if matches(p)]
+
+COLUMNS = [
+    "title", "categoryName", "address", "city", "postalCode",
+    "phone", "website", "totalScore", "reviewsCount", "url",
+]
+
+path = "austin-tattoo-shops-under-50-reviews.csv"
+with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for p in kept:
+        clean = {c: ("" if p.get(c) is None else p.get(c)) for c in COLUMNS}
+        writer.writerow(clean)
+
+print(f"Kept {len(kept)} of {len(places)} places, saved to {path}")
+```
+
+- Include the columns the user asked for. The list above is a sensible default when they did not specify.
+- Write with `encoding="utf-8-sig"` so accented business names open correctly in Excel, and `newline=""` so rows are not double spaced.
+- Leave missing values as an empty string. ***Never*** fill a gap with a placeholder, a guess, or "N/A" that could be mistaken for data.
+- Name the file after the request, and save it in the working directory unless the user asks for somewhere else.
+
+## Report back
+
+- Say how many places were scraped and how many survived the filters, as two separate numbers.
+- Give the file path, and show the first five rows in chat.
+- Name any limit that shaped the answer: a `maxCrawledPlacesPerSearch` cap that was reached, a location broader or narrower than requested, or an enrichment that returned little.
+- Treat the data as a snapshot of what Google Maps showed during the run. Ratings and review counts move, and listings can be stale or duplicated.
+
+## Cost
+
+The Actor starts at $1.50 per 1,000 scraped places, and add-ons such as contact enrichment are charged separately. A free Apify account includes $5 of monthly credit. Warn the user before any run that would scrape more than a few hundred places, and give them the number before you start rather than after.
+
+## Official references
+
+- Actor input fields, output fields, and pricing: https://apify.com/compass/crawler-google-places.md
+- Python client: https://docs.apify.com/api/client/python/docs/quick-start
